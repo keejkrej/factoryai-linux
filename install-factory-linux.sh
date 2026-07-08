@@ -259,11 +259,12 @@ fetch_electron() {
 # Step 4: assemble the Linux app tree
 # ---------------------------------------------------------------------------
 
-# Patch the titlebar decision in the minified main bundle so Linux gets a
-# native titlebar instead of a frameless macOS-style window.
-patch_asar_titlebar() { # asar_path
+# Patch the minified main bundle for Linux desktop integration:
+#   1. Native titlebar instead of a frameless macOS-style window
+#   2. Auto-hide the menu bar (press Alt to toggle) so it doesn't waste space
+patch_asar_linux() { # asar_path
   local asar="$1"
-  log "  patching app.asar: native titlebar on linux"
+  log "  patching app.asar: native titlebar + auto-hide menubar on linux"
   local work tmpdir
   tmpdir="$(mktemp -d)"
   ( cd "$tmpdir" && npx --yes @electron/asar extract "$asar" unpacked >/dev/null 2>&1 ) \
@@ -274,7 +275,14 @@ patch_asar_titlebar() { # asar_path
     warn "  titleBarStyle pattern not found; skipping patch (app may have changed)"
     rm -rf "$tmpdir"; return 0
   fi
+  # 1. Native titlebar on Linux (was: only win32 gets "default")
   sed -i 's/titleBarStyle:e?"default":"hidden"/titleBarStyle:(e||process.platform==="linux")?"default":"hidden"/' "$bundle"
+  # 2. Auto-hide the menu bar. The main BrowserWindow is created with an
+  #    options object that starts with backgroundColor:eqe(). We inject
+  #    autoHideMenuBar:true at the start of the options so it applies on Linux.
+  #    (autoHideMenuBar makes the menu bar hidden by default; pressing Alt
+  #    temporarily reveals it, same as Chrome/Firefox on Linux.)
+  sed -i 's/new Y\.BrowserWindow({backgroundColor:eqe()/new Y.BrowserWindow({autoHideMenuBar:process.platform==="linux",backgroundColor:eqe()/' "$bundle"
   ( cd "$tmpdir" && npx --yes @electron/asar pack unpacked "$asar" >/dev/null 2>&1 ) \
     || { rm -rf "$tmpdir"; die "asar repack failed"; }
   rm -rf "$tmpdir"
@@ -303,7 +311,7 @@ assemble() {
   mkdir -p "$RES/bin"
   cp "$EXTRACTED_ASAR" "$RES/app.asar"
 
-  # 4b.1 Patch app.asar: force a native titlebar on Linux.
+  # 4b.1 Patch app.asar: native titlebar + auto-hide menubar on Linux.
   #
   # The window is created with:
   #     const e = process.platform === "win32";
@@ -311,8 +319,9 @@ assemble() {
   # So Windows gets a native titlebar, but mac AND linux get "hidden" (frameless
   # with macOS traffic-light buttons). On Linux that means no titlebar at all
   # and no window decorations. We rewrite the ternary so Linux also gets
-  # "default". This is a single-string substitution in the minified main bundle.
-  patch_asar_titlebar "$RES/app.asar"
+  # "default", and inject autoHideMenuBar:true so the menu bar is hidden by
+  # default (press Alt to toggle, like Chrome/Firefox on Linux).
+  patch_asar_linux "$RES/app.asar"
 
   # 4c. Native droid binary + desktop-flag wrapper -> resources/bin/
   #
