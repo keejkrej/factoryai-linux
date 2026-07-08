@@ -392,37 +392,28 @@ LAUNCHER
 install_desktop_entry() {
   local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   local icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
-  mkdir -p "$apps" \
-           "$icons/512x512/apps" \
-           "$icons/256x256/apps" \
-           "$icons/128x128/apps" \
-           "$icons/48x48/apps"
-  # Extract the app icon from whichever source is available. We try, in order:
-  #   1. .icns inside the macOS dmg extraction (multi-size PNG container)
-  #   2. .ico inside the Windows exe/nupkg extraction
-  #   3. PNG assets bundled inside app.asar (renderer ships icon PNGs)
-  # Then install every size we can find and reference it by name in the
-  # .desktop entry so the desktop environment resolves it via the icon theme.
+  mkdir -p "$apps"
   local icon_tmp; icon_tmp="$(mktemp -d)"
   local found_icon=0
+
+  # Extract the real app icon from the official installer. The .icns (macOS)
+  # or .ico (Windows) file is the same icon users see in the dock/taskbar:
+  # Factory mark on transparent background with rounded corners.
+  #
+  # We try, in order:
+  #   1. .icns from the macOS dmg (parsed via Python, since 7z can't read icns)
+  #   2. .ico from the Windows exe/nupkg (7z can extract ico containers)
+  #   3. PNG assets from app.asar (renderer's factory-mark logo, last resort)
+  #
+  # Icons are installed into the hicolor theme at every available size so the
+  # desktop environment picks the best resolution for its display DPI.
 
   # 1. .icns from dmg source
   if [[ "$FACTORY_SOURCE" == "dmg" ]]; then
     local icns
     icns="$(find "$CACHE_DIR/src-${FACTORY_SOURCE}" -path '*Resources*' -name '*.icns' 2>/dev/null | head -1 || true)"
     if [[ -n "$icns" ]]; then
-      7z e "$icns" -o"$icon_tmp/icns" -y >/dev/null 2>&1 || true
-      # icns files contain PNGs named by size; copy each into the right dir.
-      local png
-      for png in "$icon_tmp/icns"/*.png; do
-        [[ -s "$png" ]] || continue
-        local sz; sz="$(identify_png_size "$png")"
-        [[ -n "$sz" ]] || continue
-        local dir="$icons/${sz}x${sz}/apps"
-        mkdir -p "$dir"
-        cp "$png" "$dir/factory.png"
-        found_icon=1
-      done
+      extract_icns_icons "$icns" "$icon_tmp" && found_icon=1
     fi
   fi
 
@@ -431,7 +422,6 @@ install_desktop_entry() {
     local ico
     ico="$(find "$CACHE_DIR/src-${FACTORY_SOURCE}" -name '*.ico' 2>/dev/null | head -1 || true)"
     if [[ -n "$ico" ]]; then
-      # ico is also a container 7z can unpack into individual PNGs/BMPs.
       7z e "$ico" -o"$icon_tmp/ico" -y >/dev/null 2>&1 || true
       local png
       for png in "$icon_tmp/ico"/*.png; do
@@ -450,13 +440,11 @@ install_desktop_entry() {
   if [[ "$found_icon" == "0" ]]; then
     local asar_tmp; asar_tmp="$(mktemp -d)"
     if ( cd "$asar_tmp" && npx --yes @electron/asar extract "$EXTRACTED_ASAR" unpacked >/dev/null 2>&1 ); then
-      # The renderer ships logo/icon PNGs under the assets directory.
       local best_png="" best_sz=0 png
       while IFS= read -r png; do
         [[ -s "$png" ]] || continue
         local sz; sz="$(identify_png_size "$png")"
         [[ -n "$sz" ]] || continue
-        # Pick the largest available; also install each standard size.
         for want in 48 128 256 512; do
           if [[ "$sz" == "$want" ]]; then
             local dir="$icons/${sz}x${sz}/apps"
@@ -467,8 +455,8 @@ install_desktop_entry() {
         done
         if [[ "$sz" -gt "$best_sz" ]]; then best_sz="$sz"; best_png="$png"; fi
       done < <(find "$asar_tmp/unpacked" -type f \( -iname '*icon*.png' -o -iname '*logo*.png' -o -iname 'factory*.png' \) 2>/dev/null)
-      # If no exact standard size matched, install the largest as 512.
       if [[ "$found_icon" == "0" && -n "$best_png" ]]; then
+        mkdir -p "$icons/512x512/apps"
         cp "$best_png" "$icons/512x512/apps/factory.png"
         found_icon=1
       fi
@@ -476,9 +464,13 @@ install_desktop_entry() {
     rm -rf "$asar_tmp"
   fi
 
-  [[ "$found_icon" == "1" ]] \
-    && log "  icon installed to $icons" \
-    || warn "  no icon found; .desktop will use a generic application icon"
+  # Fill in any missing standard sizes by resizing the largest available icon.
+  if [[ "$found_icon" == "1" ]]; then
+    fill_missing_icon_sizes "$icons"
+    log "  icon installed to $icons"
+  else
+    warn "  no icon found; .desktop will use a generic application icon"
+  fi
 
   rm -rf "$icon_tmp"
 
@@ -498,24 +490,112 @@ DESKTOP
   gtk-update-icon-cache -f -t "${icons%/hicolor}" 2>/dev/null || true
 }
 
-# Read the dimensions of a PNG file and echo "WxH" (e.g. "512x512"). We only
-# need the size for sorting into the right hicolor dir. Reads the IHDR chunk
-# directly so we don't depend on file/ImageMagick being installed.
+# Extract PNG icons from a macOS .icns file. 7z cannot read icns (it's an
+# Apple container format), so we parse it in Python: the file is a sequence of
+# chunks, each tagged with a 4-char OSType and a big-endian length. Many chunk
+# types (ic07..ic14) embed a full PNG file directly in the chunk payload.
+# We extract each embedded PNG and install it at its actual pixel size.
+extract_icns_icons() { # icns_path outdir
+  local icns="$1" outdir="$2"
+  python3 - "$icns" "$outdir" <<'PYEOF'
+import struct, os, sys
+
+icns_path, outdir = sys.argv[1], sys.argv[2]
+
+# icns OSType -> actual pixel size of the icon
+ICNS_SIZES = {
+    "ic04": 16,    "ic05": 32,    "icp4": 16,   "icp5": 32,
+    "icp6": 64,    "ic07": 128,   "ic08": 256,  "ic09": 512,
+    "ic10": 1024,  "ic11": 32,    "ic12": 64,   "ic13": 256,
+    "ic14": 512,   "icsb": 128,
+}
+
+with open(icns_path, "rb") as f:
+    data = f.read()
+
+if data[:4] != b"icns":
+    sys.exit(1)
+
+file_len = struct.unpack(">I", data[4:8])[0]
+offset = 8
+count = 0
+while offset + 8 <= len(data):
+    ostype = data[offset:offset+4].decode("ascii", errors="replace")
+    chunk_len = struct.unpack(">I", data[offset+4:offset+8])[0]
+    if chunk_len < 8 or offset + chunk_len > len(data):
+        break
+    payload = data[offset+8:offset+chunk_len]
+    sz = ICNS_SIZES.get(ostype)
+    if sz and payload[:4] == b"\x89PNG":
+        out = os.path.join(outdir, f"{sz}.png")
+        with open(out, "wb") as f:
+            f.write(payload)
+        count += 1
+    offset += chunk_len
+
+# Signal success to the caller via stdout
+if count > 0:
+    print(f"extracted {count} icons from icns")
+PYEOF
+  local rc=$?
+  [[ "$rc" == "0" ]] || return 1
+
+  local icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
+  local png
+  for png in "$outdir"/*.png; do
+    [[ -s "$png" ]] || continue
+    local sz; sz="$(basename "$png" .png)"
+    local dir="$icons/${sz}x${sz}/apps"
+    mkdir -p "$dir"
+    cp "$png" "$dir/factory.png"
+  done
+  return 0
+}
+
+# Ensure all standard hicolor sizes (16, 32, 48, 64, 128, 256, 512, 1024)
+# have a factory.png by resizing from the nearest larger available icon.
+# Uses Pillow if available; falls back to copying if not.
+fill_missing_icon_sizes() { # icons_root
+  local icons="$1"
+  local standards=(16 32 48 64 128 256 512 1024)
+  for sz in "${standards[@]}"; do
+    local target="$icons/${sz}x${sz}/apps/factory.png"
+    [[ -s "$target" ]] && continue
+    # Find the nearest larger available icon
+    local src="" src_sz=999999
+    local avail
+    avail="$(find "$icons" -name 'factory.png' 2>/dev/null)"
+    local a
+    for a in $avail; do
+      local a_sz
+      a_sz="$(echo "$a" | grep -oE '[0-9]+x[0-9]+' | head -1 | cut -dx -f1)"
+      [[ -n "$a_sz" ]] || continue
+      if [[ "$a_sz" -gt "$sz" && "$a_sz" -lt "$src_sz" ]]; then
+        src="$a"; src_sz="$a_sz"
+      fi
+    done
+    [[ -n "$src" ]] || continue
+    mkdir -p "$icons/${sz}x${sz}/apps"
+    if python3 -c "from PIL import Image" 2>/dev/null; then
+      python3 -c "from PIL import Image; Image.open('$src').resize(($sz,$sz), Image.LANCZOS).save('$target')"
+    else
+      cp "$src" "$target"
+    fi
+  done
+}
+
+# Read the dimensions of a PNG file and echo the width (square only). Reads
+# the IHDR chunk directly so we don't depend on file/ImageMagick.
 identify_png_size() { # file
   local f="$1"
-  # PNG signature is 8 bytes, then IHDR (length=13, "IHDR", width, height).
-  # Width/height are big-endian 32-bit ints at file offsets 16 and 20.
   [[ -s "$f" ]] || return 0
-  # Verify PNG signature (first 8 bytes: 89 50 4E 47 0D 0A 1A 0A)
   local sig; sig="$(head -c 8 "$f" | od -An -tx1 | tr -d ' \n')"
   [[ "$sig" == "89504e470d0a1a0a" ]] || return 0
   local w h
   w="$(head -c 24 "$f" | tail -c 8 | od -An -N4 -tx1 | tr -d ' \n')"
   h="$(head -c 28 "$f" | tail -c 4 | od -An -N4 -tx1 | tr -d ' \n')"
-  # Convert hex to decimal
   w=$((16#$w))
   h=$((16#$h))
-  # Square icons only; non-square images aren't app-menu icons.
   [[ "$w" == "$h" ]] && echo "$w"
 }
 
