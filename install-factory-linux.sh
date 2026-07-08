@@ -392,19 +392,96 @@ LAUNCHER
 install_desktop_entry() {
   local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   local icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
-  mkdir -p "$apps" "$icons/512x512/apps"
-  # Extract the app icon from the asar (renderer ships PNG assets). Fall back
-  # gracefully if not found.
-  local icon=""
-  icon="$(find "$CACHE_DIR/src-${FACTORY_SOURCE}" -path '*Resources*' -name '*.icns' 2>/dev/null | head -1 || true)"
-  if [[ -n "$icon" ]]; then
-    # Convert .icns -> png via 7z (icns is a container); best-effort.
-    7z e "$icon" -o"$icons/_icns_tmp" -y >/dev/null 2>&1 || true
-    local png
-    png="$(find "$icons/_icns_tmp" -name '*.png' -size +2k 2>/dev/null | sort -r | head -1 || true)"
-    if [[ -n "$png" ]]; then cp "$png" "$icons/512x512/apps/factory.png"; fi
-    rm -rf "$icons/_icns_tmp"
+  mkdir -p "$apps" \
+           "$icons/512x512/apps" \
+           "$icons/256x256/apps" \
+           "$icons/128x128/apps" \
+           "$icons/48x48/apps"
+  # Extract the app icon from whichever source is available. We try, in order:
+  #   1. .icns inside the macOS dmg extraction (multi-size PNG container)
+  #   2. .ico inside the Windows exe/nupkg extraction
+  #   3. PNG assets bundled inside app.asar (renderer ships icon PNGs)
+  # Then install every size we can find and reference it by name in the
+  # .desktop entry so the desktop environment resolves it via the icon theme.
+  local icon_tmp; icon_tmp="$(mktemp -d)"
+  local found_icon=0
+
+  # 1. .icns from dmg source
+  if [[ "$FACTORY_SOURCE" == "dmg" ]]; then
+    local icns
+    icns="$(find "$CACHE_DIR/src-${FACTORY_SOURCE}" -path '*Resources*' -name '*.icns' 2>/dev/null | head -1 || true)"
+    if [[ -n "$icns" ]]; then
+      7z e "$icns" -o"$icon_tmp/icns" -y >/dev/null 2>&1 || true
+      # icns files contain PNGs named by size; copy each into the right dir.
+      local png
+      for png in "$icon_tmp/icns"/*.png; do
+        [[ -s "$png" ]] || continue
+        local sz; sz="$(identify_png_size "$png")"
+        [[ -n "$sz" ]] || continue
+        local dir="$icons/${sz}x${sz}/apps"
+        mkdir -p "$dir"
+        cp "$png" "$dir/factory.png"
+        found_icon=1
+      done
+    fi
   fi
+
+  # 2. .ico from exe source
+  if [[ "$found_icon" == "0" && "$FACTORY_SOURCE" == "exe" ]]; then
+    local ico
+    ico="$(find "$CACHE_DIR/src-${FACTORY_SOURCE}" -name '*.ico' 2>/dev/null | head -1 || true)"
+    if [[ -n "$ico" ]]; then
+      # ico is also a container 7z can unpack into individual PNGs/BMPs.
+      7z e "$ico" -o"$icon_tmp/ico" -y >/dev/null 2>&1 || true
+      local png
+      for png in "$icon_tmp/ico"/*.png; do
+        [[ -s "$png" ]] || continue
+        local sz; sz="$(identify_png_size "$png")"
+        [[ -n "$sz" ]] || continue
+        local dir="$icons/${sz}x${sz}/apps"
+        mkdir -p "$dir"
+        cp "$png" "$dir/factory.png"
+        found_icon=1
+      done
+    fi
+  fi
+
+  # 3. Fallback: extract PNG icons from app.asar renderer assets.
+  if [[ "$found_icon" == "0" ]]; then
+    local asar_tmp; asar_tmp="$(mktemp -d)"
+    if ( cd "$asar_tmp" && npx --yes @electron/asar extract "$EXTRACTED_ASAR" unpacked >/dev/null 2>&1 ); then
+      # The renderer ships logo/icon PNGs under the assets directory.
+      local best_png="" best_sz=0 png
+      while IFS= read -r png; do
+        [[ -s "$png" ]] || continue
+        local sz; sz="$(identify_png_size "$png")"
+        [[ -n "$sz" ]] || continue
+        # Pick the largest available; also install each standard size.
+        for want in 48 128 256 512; do
+          if [[ "$sz" == "$want" ]]; then
+            local dir="$icons/${sz}x${sz}/apps"
+            mkdir -p "$dir"
+            cp "$png" "$dir/factory.png"
+            found_icon=1
+          fi
+        done
+        if [[ "$sz" -gt "$best_sz" ]]; then best_sz="$sz"; best_png="$png"; fi
+      done < <(find "$asar_tmp/unpacked" -type f \( -iname '*icon*.png' -o -iname '*logo*.png' -o -iname 'factory*.png' \) 2>/dev/null)
+      # If no exact standard size matched, install the largest as 512.
+      if [[ "$found_icon" == "0" && -n "$best_png" ]]; then
+        cp "$best_png" "$icons/512x512/apps/factory.png"
+        found_icon=1
+      fi
+    fi
+    rm -rf "$asar_tmp"
+  fi
+
+  [[ "$found_icon" == "1" ]] \
+    && log "  icon installed to $icons" \
+    || warn "  no icon found; .desktop will use a generic application icon"
+
+  rm -rf "$icon_tmp"
+
   cat > "$apps/factory.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
@@ -418,6 +495,28 @@ StartupWMClass=Factory
 MimeType=x-scheme-handler/factory;
 DESKTOP
   update-desktop-database "$apps" 2>/dev/null || true
+  gtk-update-icon-cache -f -t "${icons%/hicolor}" 2>/dev/null || true
+}
+
+# Read the dimensions of a PNG file and echo "WxH" (e.g. "512x512"). We only
+# need the size for sorting into the right hicolor dir. Reads the IHDR chunk
+# directly so we don't depend on file/ImageMagick being installed.
+identify_png_size() { # file
+  local f="$1"
+  # PNG signature is 8 bytes, then IHDR (length=13, "IHDR", width, height).
+  # Width/height are big-endian 32-bit ints at file offsets 16 and 20.
+  [[ -s "$f" ]] || return 0
+  # Verify PNG signature (first 8 bytes: 89 50 4E 47 0D 0A 1A 0A)
+  local sig; sig="$(head -c 8 "$f" | od -An -tx1 | tr -d ' \n')"
+  [[ "$sig" == "89504e470d0a1a0a" ]] || return 0
+  local w h
+  w="$(head -c 24 "$f" | tail -c 8 | od -An -N4 -tx1 | tr -d ' \n')"
+  h="$(head -c 28 "$f" | tail -c 4 | od -An -N4 -tx1 | tr -d ' \n')"
+  # Convert hex to decimal
+  w=$((16#$w))
+  h=$((16#$h))
+  # Square icons only; non-square images aren't app-menu icons.
+  [[ "$w" == "$h" ]] && echo "$w"
 }
 
 # ---------------------------------------------------------------------------
