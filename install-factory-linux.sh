@@ -270,7 +270,7 @@ patch_asar_linux() { # asar_path
   ( cd "$tmpdir" && npx --yes @electron/asar extract "$asar" unpacked >/dev/null 2>&1 ) \
     || { rm -rf "$tmpdir"; die "asar extract failed"; }
   local bundle
-  bundle="$(grep -rl 'titleBarStyle:e?"default":"hidden"' "$tmpdir/unpacked/.vite/build/" | head -1)"
+  bundle="$(grep -rl 'titleBarStyle:e?"default":"hidden"' "$tmpdir/unpacked/.vite/build/" | head -1 || true)"
   if [[ -z "$bundle" ]]; then
     warn "  titleBarStyle pattern not found; skipping patch (app may have changed)"
     rm -rf "$tmpdir"; return 0
@@ -605,7 +605,11 @@ identify_png_size() { # file
   h="$(head -c 28 "$f" | tail -c 4 | od -An -N4 -tx1 | tr -d ' \n')"
   w=$((16#$w))
   h=$((16#$h))
-  [[ "$w" == "$h" ]] && echo "$w"
+  if [[ "$w" == "$h" ]]; then
+    echo "$w"
+  else
+    return 0
+  fi
 }
 
 # ---------------------------------------------------------------------------
